@@ -125,6 +125,60 @@ Two facts force the extra conditions:
 
 ---
 
+## Concurrent use of the computer, and what actually interferes
+
+UI Automation addresses controls directly rather than injecting input at the cursor position, so the
+*download* does not need the window focused. The *keyboard* is a different matter.
+
+Measured 2026-11-23 during live downloads:
+
+| interference | result |
+|---|---|
+| 156 cursor movements across the screen during one download | `OK 99.6 MB (3.1s)`, unaffected |
+| Focus pulled away from the Historical Data window 11 times | `OK 99.6 MB (2.2s)`, unaffected |
+| Date field rewritten 12 times mid-run, simulating a user editing it | `REFUSING TO CLICK: inst='RTY 12-26' date='11/19/2026'` → `FAIL`, no file created |
+
+### Keyboard focus moves to NinjaTrader, once per item
+
+Writing an Infragistics `XamMaskedEditor` (the date box), invoking the Download button, and
+expanding the replay section each move **keyboard focus** to that control. Sampling the focused
+window during a run shows it plainly:
+
+```
+before run     -> your window
+on click       -> NinjaTrader
+after restore  -> your window
+```
+
+So anything typed at that moment can go into NinjaTrader instead of where it was intended.
+
+`Restore-Foreground` puts the previously focused window back, and it is called after the click and
+again at the end of each item. **It is best effort, not a guarantee.** Over repeated runs the
+foreground sometimes does not come back, because Windows restricts background processes from taking
+the foreground and the target window's activation is asynchronous — the restore races it. One
+attempt with a `Start-Sleep` before it helped in some runs and not others.
+
+This is why the README tells users to expect interrupted typing rather than promising otherwise, and
+why `-NoFocusRestore` exists for a predictable alternative. Do not claim this is solved without
+re-measuring.
+
+### Closing the window needs WM_CLOSE
+
+`WindowPattern.Close()` on the Historical Data window returns **without error and does not close
+it** — verified by re-enumerating the window list afterwards. `PostMessage(hwnd, WM_CLOSE)` does
+work. `-CloseWindow` therefore uses WM_CLOSE and then polls until the window is actually gone before
+reporting success; an earlier version printed "closed" while the window was still open.
+
+The read-back check that produces the `REFUSING TO CLICK` guard is not incidental. The script writes
+the instrument and date, then re-reads both and compares them against what was requested before
+clicking. Without that check the run would have silently downloaded **2026-11-19** instead of
+2026-11-20, which is far worse than a `FAIL`, because it would look like success.
+
+Re-running the same command after such a `FAIL` is the correct recovery: files already present are
+skipped, so it resumes rather than repeating work.
+
+---
+
 ## The click must be verified, not trusted
 
 `InvokePattern` against a **minimised** WPF window can be a silent no-op: no exception, the button

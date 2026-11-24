@@ -56,6 +56,50 @@ It uses the NinjaTrader session you already have.
 
 ---
 
+## Using your computer while it runs
+
+The mouse is free. The **keyboard is not reliably yours** while a run is in progress.
+
+Each item touches NinjaTrader's controls, and that moves **keyboard focus** to the window — even
+though the script never asks for focus and does not activate NinjaTrader. Measured during a live
+run, sampling the focused window:
+
+```
+before run        -> your window
+on click          -> NinjaTrader
+after restore     -> your window
+```
+
+So focus is taken and then handed back, once per item. If you are typing at the moment it happens,
+those keystrokes can go to NinjaTrader instead of where you meant.
+
+The script restores the window you had focused before each item, and this usually works, but
+**treat it as best effort rather than a guarantee**. Over repeated runs it sometimes does not stick,
+leaving focus in NinjaTrader until you click back. Windows restricts background processes from
+taking the foreground, and the window's activation is asynchronous, so the restore races it.
+
+Practical guidance: for a long backfill, expect that typing may be interrupted and click back to
+your window if it is. For a short run, just wait until it finishes.
+
+If you would rather the script never touched focus at all, pass `-NoFocusRestore`. Focus will then
+stay in NinjaTrader between items, which is predictable rather than intermittent.
+
+**Do not edit the Historical Data window while a run is in progress** — don't change the instrument
+or date boxes, click Download, or close the window. The script re-reads those fields immediately
+before clicking, so if they change underneath it, it refuses to click rather than requesting the
+wrong day:
+
+```
+REFUSING TO CLICK: inst='RTY 12-26' date='11/19/2026'
+```
+
+That date is then reported `FAIL`. Nothing is downloaded wrongly, but the run does stop on that
+item. Re-run the same command and it continues from where it stopped.
+
+Interacting with NinjaTrader's charts or DOMs is harmless; it is only that one window that matters.
+
+---
+
 ## Install
 
 Put the script somewhere permanent — not inside your NinjaTrader data folder, since almost
@@ -232,6 +276,20 @@ Open the window manually (`Tools → Historical Data`), then run:
 
 If that reports any control as `MISSING`, NinjaTrader has renamed a UI element, most likely after
 a version upgrade. Please open an issue with your NinjaTrader version.
+
+### Someone used the keyboard and a date came back `FAIL`
+
+Look at the reason printed against that date. If it says `REFUSING TO CLICK: inst='...'
+date='...'`, the window's fields were changed underneath the script — usually because someone typed
+in the instrument or date box while it was running.
+
+That is the guard working correctly: the script compares what it wrote against what the window
+actually holds, and declines to click rather than requesting a day you did not ask for. Re-run the
+same command to pick up where it stopped.
+
+Ordinary typing elsewhere does not corrupt a run. It may land in NinjaTrader instead of your
+document, because focus moves there briefly for each item — see
+[Using your computer while it runs](#using-your-computer-while-it-runs).
 
 ### `click did not register -- restoring the window and retrying once`
 

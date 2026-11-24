@@ -61,6 +61,12 @@
 .PARAMETER Trace
     Print per-step timings. Useful when reporting a performance problem.
 
+.PARAMETER NoFocusRestore
+    Each item briefly takes keyboard focus, so typing may land in NinjaTrader. By default the
+    script then tries to return focus to the window you had. That is best effort and can fail.
+    Set this to skip the attempt and leave focus in NinjaTrader throughout, which is fewer
+    surprises on an unattended run.
+
 .PARAMETER DumpControls
     Print the state of the Historical Data controls and exit. Run this after a NinjaTrader
     upgrade if the script stops finding the window.
@@ -106,6 +112,11 @@ param(
     [int]$ClickGraceSec = 6,
     [int]$PollMs = 200,
     [int]$SettleSec = 0,
+    # Each item briefly takes keyboard focus (writing the date box, clicking Download), after which
+    # the script tries to give the window you had focused back. That restore is best effort and
+    # sometimes does not stick. Set this to skip the restore entirely, so focus simply stays in
+    # NinjaTrader between items rather than intermittently jumping back and forth.
+    [switch]$NoFocusRestore,
     [switch]$Trace,
     [switch]$CloseWindow
 )
@@ -332,6 +343,70 @@ function File-State([string]$path) {
     return [pscustomobject]@{ Size = $f.Length; MTime = $f.LastWriteTimeUtc }
 }
 
+# ---------------------------------------------------------------------- foreground focus
+# Interacting with the NinjaTrader controls moves keyboard focus to them, even though the script
+# never asks for it and the window is not activated:
+#
+#     writing the date  -> focus moves to HistoricalDataWindowMarketReplayDateSelector
+#                          (an Infragistics XamMaskedEditor, which focuses itself on set)
+#     clicking Download -> focus moves to the Download button
+#     expanding replay  -> focus moves to the expander
+#
+# While that happens, anything typed in another application goes to NinjaTrader instead. The fix is
+# to note which window the user had focused immediately before an item, then hand focus back.
+#
+# AttachThreadInput is needed because Windows only lets a process call SetForegroundWindow while it
+# owns the foreground; from a background script the call is otherwise reduced to a taskbar flash.
+if (-not ([System.Management.Automation.PSTypeName]'ReplayDownloader.NativeMethods').Type) {
+    Add-Type -Namespace ReplayDownloader -Name NativeMethods -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr procId);
+[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+'@
+}
+
+function Get-ForegroundWindowHandle {
+    try { return [ReplayDownloader.NativeMethods]::GetForegroundWindow() } catch { return [IntPtr]::Zero }
+}
+
+# Hand focus back to a previously foreground window. Returns $false if it could not be done, which
+# is not fatal -- the run is unaffected, only the user's typing is.
+#
+# RETRIES. Activation is asynchronous: opening the Historical Data window asks Windows to bring
+# NinjaTrader forward, and that can complete AFTER this function is first called. A single attempt
+# therefore loses the race and the user is left typing into NinjaTrader. Measured 2026-11-23: one
+# restore attempt was not enough when the window had to be opened, and the foreground stayed on
+# NinjaTrader for the whole run.
+function Restore-Foreground([IntPtr]$hwnd, [int]$attempts = 4, [int]$delayMs = 150) {
+    if ($hwnd -eq [IntPtr]::Zero) { return $false }
+    for ($i = 0; $i -lt $attempts; $i++) {
+        try {
+            if (-not [ReplayDownloader.NativeMethods]::IsWindow($hwnd)) { return $false }
+            $fg = [ReplayDownloader.NativeMethods]::GetForegroundWindow()
+            if ($fg -eq $hwnd) { return $true }
+
+            $fgThread = [ReplayDownloader.NativeMethods]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)
+            $myThread = [ReplayDownloader.NativeMethods]::GetCurrentThreadId()
+            $attached = $false
+            if ($fgThread -ne $myThread) {
+                $attached = [ReplayDownloader.NativeMethods]::AttachThreadInput($fgThread, $myThread, $true)
+            }
+            try { [void][ReplayDownloader.NativeMethods]::SetForegroundWindow($hwnd) } finally {
+                if ($attached) {
+                    [void][ReplayDownloader.NativeMethods]::AttachThreadInput($fgThread, $myThread, $false)
+                }
+            }
+            Start-Sleep -Milliseconds $delayMs
+            if ([ReplayDownloader.NativeMethods]::GetForegroundWindow() -eq $hwnd) { return $true }
+        } catch { }
+    }
+    return $false
+}
+
 # ---------------------------------------------------------------------- partial-file guard
 # NinjaTrader writes a replay file incrementally, so a run that is killed mid-transfer leaves a
 # short file that looks finished to a "size greater than zero" test. Accepting one would leave a
@@ -410,11 +485,31 @@ function Resolve-Contract([string]$root, [datetime]$date) {
 }
 
 # ---------------------------------------------------------------------- plan
+# Dates arrive either as an inclusive range (already DateTime) or as strings from -Dates. The two
+# paths are kept separate: parsing a DateTime back through a string is lossy and locale dependent.
 if (-not $Dates -and $From -and $To) {
     $d = $From.Date; $Dates = @()
     while ($d -le $To.Date) {
         if (-not $WeekdaysOnly -or $d.DayOfWeek -notin 'Saturday', 'Sunday') { $Dates += $d }
         $d = $d.AddDays(1)
+    }
+} elseif ($Dates) {
+    # Split embedded commas first. When the script is started as
+    #     powershell -File Invoke-ReplayDownload.ps1 -Dates 2026-11-12,2026-11-13
+    # the whole list arrives as ONE string, because -File does not perform the comma-to-array
+    # conversion an interactive session does. Without this the parse fails and the run silently
+    # requests nothing at all.
+    $rawDates = @($Dates | ForEach-Object { $_ -split ',' } |
+                  ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $Dates = @()
+    foreach ($rd in $rawDates) {
+        $parsedDate = [datetime]::MinValue
+        if (-not [datetime]::TryParse($rd, [System.Globalization.CultureInfo]::InvariantCulture,
+                                      'None', [ref]$parsedDate)) {
+            Write-Host ("Unrecognised date: '{0}'. Use yyyy-MM-dd, for example 2026-11-20." -f $rd) -ForegroundColor Red
+            exit 2
+        }
+        $Dates += $parsedDate.Date
     }
 }
 
@@ -439,7 +534,6 @@ if (-not $Dates) {
     Write-Host 'Example: .\Invoke-ReplayDownload.ps1 -AutoContract -Roots NQ -From 2026-11-01 -To 2026-11-20 -WeekdaysOnly'
     exit 2
 }
-$Dates = @($Dates | ForEach-Object { ([datetime]$_).Date })
 
 if (-not $AutoContract -and -not $Instrument) {
     Write-Host 'Name an instrument with -Instrument, or use -AutoContract with -Roots.' -ForegroundColor Red
@@ -574,12 +668,33 @@ if (-not $ntProc) {
     Write-Host '  running and connected. Start it, then re-run this script.'
     exit 3
 }
+$userFocusBeforePreflight = Get-ForegroundWindowHandle
+if ($Trace) {
+    Write-Host ('  [trace] focus before preflight: hwnd={0}' -f $userFocusBeforePreflight) -ForegroundColor DarkMagenta
+}
 $hd0 = Open-HistoricalData
 if (-not $hd0) {
     Write-Host ''
     Write-Host 'Could not open Tools > Historical Data in NinjaTrader.' -ForegroundColor Red
     Write-Host '  Open it manually, then run -DumpControls to check that the script can see the controls.'
+    if (-not $NoFocusRestore) { [void](Restore-Foreground $userFocusBeforePreflight) }
     exit 3
+}
+# Opening the window takes keyboard focus; give it straight back before the loop starts.
+#
+# This needs more patience than the per-item restores. Opening the window is an asynchronous
+# activation, so a short burst of attempts all lands while NinjaTrader is still coming forward and
+# loses. Measured 2026-11-23: four attempts over 600 ms returned False with the foreground still on
+# NinjaTrader. Settling first, then retrying for up to ~2 s, is what actually wins.
+if (-not $NoFocusRestore) {
+    Start-Sleep -Milliseconds 400
+    $restored = Restore-Foreground -hwnd $userFocusBeforePreflight -attempts 10 -delayMs 200
+    if ($Trace) {
+        Write-Host ('  [trace] focus restore after open: {0} (now hwnd={1})' -f $restored, (Get-ForegroundWindowHandle)) -ForegroundColor DarkMagenta
+    }
+    if (-not $restored) {
+        Write-Host '  note        : NinjaTrader kept the foreground; click back to what you were doing' -ForegroundColor DarkGray
+    }
 }
 Write-Host ('  window      : Historical Data ready (pid {0})' -f $ntProc.Id) -ForegroundColor DarkGray
 
@@ -617,6 +732,11 @@ foreach ($item in $queue) {
         Write-Host ('        TRUNCATED ({0:N1} MB, log says {1:N1} MB) -- re-downloading' -f ($before.Size / 1MB), $expect) -ForegroundColor Yellow
         Remove-Item -LiteralPath $item.Target -Force -ErrorAction SilentlyContinue
     }
+
+    # Note which window the user has focused BEFORE touching NinjaTrader, so focus can be handed
+    # back afterwards. Captured per item rather than once, so it follows the user around instead of
+    # dragging them back to whatever was focused when the run started.
+    $prevHwnd = Get-ForegroundWindowHandle
 
     # Re-acquire: dismissing a dialog from the previous item rebuilds the control tree.
     $c = Get-Controls
@@ -673,6 +793,7 @@ foreach ($item in $queue) {
         }
     } catch {
         Write-Host ('        could not set fields: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        if (-not $NoFocusRestore) { [void](Restore-Foreground $prevHwnd) }
         $results += [pscustomobject]@{ Item = $label; Status = 'FAIL'; Detail = 'set failed' }
         continue
     }
@@ -685,6 +806,7 @@ foreach ($item in $queue) {
                                    'None', [ref]$parsed) -and ($parsed.Date -eq $item.Date)
     if ($vInst -ne $item.Instrument -or -not $dateOk) {
         Write-Host ('        REFUSING TO CLICK: inst=''{0}'' date=''{1}''' -f $vInst, $vDate) -ForegroundColor Red
+        if (-not $NoFocusRestore) { [void](Restore-Foreground $prevHwnd) }
         $results += [pscustomobject]@{ Item = $label; Status = 'FAIL'; Detail = "verify '$vInst'/'$vDate'" }
         continue
     }
@@ -696,6 +818,21 @@ foreach ($item in $queue) {
         $results += [pscustomobject]@{ Item = $label; Status = 'FAIL'; Detail = 'click failed' }
         continue
     }
+
+    # The download now runs inside NinjaTrader while this script only watches a file and a label, so
+    # there is nothing left that needs the window focused. Try to hand the keyboard back before the
+    # wait, so the user can keep working during the transfer.
+    #
+    # THIS IS BEST EFFORT, NOT A GUARANTEE. Measured 2026-11-23 over repeated runs: sometimes the
+    # foreground returns to the user's window and sometimes it stays on NinjaTrader. Windows heavily
+    # restricts background processes from taking the foreground, and activation of the target window
+    # is asynchronous, so the two race. Treat focus moving to NinjaTrader as expected during a run,
+    # which is what the README says.
+    if (-not $NoFocusRestore) {
+        Start-Sleep -Milliseconds 250
+        [void](Restore-Foreground -hwnd $prevHwnd -attempts 8 -delayMs 200)
+    }
+
     $clickConfirmed = $false
     $retriedClick = $false
 
@@ -797,6 +934,10 @@ foreach ($item in $queue) {
         $results += [pscustomobject]@{ Item = $label; Status = $outcome; Detail = $detail }
         $fileTimes += $itemSw.Elapsed.TotalSeconds
     }
+
+    # Belt and braces: a dialog dismissal or a retried click may have moved focus again after the
+    # restore that follows the first click. Put it back once more before the next item begins.
+    if (-not $NoFocusRestore) { [void](Restore-Foreground $prevHwnd) }
 }
 
 # ---------------------------------------------------------------------- report
@@ -827,11 +968,24 @@ Write-Host ''
 Write-Host ('  log         : {0}' -f $script:LogFile) -ForegroundColor DarkGray
 
 if ($CloseWindow) {
+    # WindowPattern.Close() does NOT work on this window: it returns without error and the window
+    # stays open. Verified 2026-11-23 by re-enumerating the window list afterwards. WM_CLOSE does
+    # work, so that is used instead, and the result is verified rather than assumed -- an earlier
+    # version printed "closed" while the window was still there.
+    $closedOk = $false
     try {
-        $wpc = $hd0.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
-        $wpc.Close()
+        $wh = [IntPtr](Get-HDWindow).Current.NativeWindowHandle
+        [void][ReplayDownloader.NativeMethods]::PostMessage($wh, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+        for ($i = 0; $i -lt 25; $i++) {
+            Start-Sleep -Milliseconds 200
+            if (-not (Get-HDWindow)) { $closedOk = $true; break }
+        }
+    } catch { }
+    if ($closedOk) {
         Write-Host '  window      : closed' -ForegroundColor DarkGray
-    } catch { Write-Host '  window      : could not close' -ForegroundColor DarkGray }
+    } else {
+        Write-Host '  window      : could NOT close it -- close it manually if you want it gone' -ForegroundColor Yellow
+    }
 }
 
 if ($fail.Count) { exit 1 }
