@@ -52,7 +52,7 @@ Put the script somewhere permanent — not inside your NinjaTrader data folder, 
 everything in there is disposable.
 
 ```powershell
-git clone https://github.com/<owner>/nt-replay-downloader.git
+git clone https://github.com/lecrackzor/nt-replay-downloader.git
 cd nt-replay-downloader
 ```
 
