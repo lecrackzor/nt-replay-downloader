@@ -1,0 +1,13 @@
+# Run logs. Keep these locally -- they record completed file sizes and are used to detect
+# half-finished downloads. They are specific to one machine, so they are not tracked.
+logs/
+
+# Replay data, in case anyone points the tool at a checkout directory
+*.nrd
+
+# Windows / editor cruft
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+*.user
