@@ -8,6 +8,16 @@ This script does it for you. Give it a date range and a symbol, and it downloads
 turn, skipping anything already on disk, and tells you exactly which days the server does not
 have.
 
+> [!IMPORTANT]
+> **NinjaTrader must be open, running and connected to your data feed while this runs.**
+>
+> Replay data is delivered over NinjaTrader's own connection to its servers. It is not an HTTP
+> download and there is no API key or URL to use instead, so the script cannot fetch anything
+> with NinjaTrader closed — it will exit with a message telling you to start it.
+>
+> You do **not** have to open the Historical Data window yourself; the script does that. It is
+> NinjaTrader itself that has to be running.
+
 ```
 .\Invoke-ReplayDownload.ps1 -AutoContract -Roots NQ,ES -From 2026-09-01 -To 2026-11-20 -WeekdaysOnly
 ```
@@ -63,6 +73,8 @@ is a single self-contained script.
 
 ## Quick start
 
+**Start NinjaTrader and connect to your data feed first.** Everything below needs it running.
+
 ```powershell
 # 1. Find out what you would get, without downloading anything.
 .\Invoke-ReplayDownload.ps1 -Plan -AutoContract -Roots NQ -From 2026-11-01 -To 2026-11-20 -WeekdaysOnly
@@ -73,6 +85,7 @@ is a single self-contained script.
 
 Run `-Plan` first whenever you are about to fetch a large range. It never touches NinjaTrader,
 takes well under a second, and prints coverage per contract plus the dates you are missing.
+`-Plan` is the one thing that works with NinjaTrader closed, because it only reads your disk.
 
 ### Windows may block the script the first time
 
