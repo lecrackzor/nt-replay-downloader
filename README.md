@@ -46,6 +46,21 @@ It uses the NinjaTrader session you already have.
 
 ---
 
+## Install
+
+Put the script somewhere permanent — not inside your NinjaTrader data folder, since almost
+everything in there is disposable.
+
+```powershell
+git clone https://github.com/<owner>/nt-replay-downloader.git
+cd nt-replay-downloader
+```
+
+Or download the folder and extract it anywhere, for example `C:\Tools\nt-replay-downloader`.
+
+There is nothing to install, no module to import and no dependency to restore. `Invoke-ReplayDownload.ps1`
+is a single self-contained script.
+
 ## Quick start
 
 ```powershell
